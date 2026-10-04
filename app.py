@@ -29,7 +29,7 @@ DISPLAY = {
     "reason_text": "Reason",
     "event_time": "Time",
 }
-LABEL_TO_FIELD = {label: field for field, label in DISPLAY.items()}
+SHOW_FIELDS = ["event_index", "udi", "product_id", "type", *SENSORS, "failure", "anomaly", "reason_text"]
 
 
 def new_state():
@@ -170,8 +170,7 @@ def live_dashboard():
         with log_col:
             log_scale = st.checkbox("Log event axis", value=False)
 
-        signal = LABEL_TO_FIELD[chosen]
-        if signal in view.columns:
+        if chosen in view.columns:
             plotted = view
             if len(view) > MAX_POINTS:
                 plotted = view.iloc[:: len(view) // MAX_POINTS + 1]
@@ -212,16 +211,12 @@ def live_dashboard():
             st.bar_chart(reasons["reasons"].value_counts())
 
     st.subheader(f"Recent {RECENT} Events")
-    columns = [
-        DISPLAY[name]
-        for name in ["event_index", "udi", "product_id", "type", *SENSORS, "failure", "anomaly", "reason_text"]
-        if name in view.columns
-    ]
-    st.dataframe(
-        recent[columns].sort_values("Event", ascending=False),
-        use_container_width=True,
-        hide_index=True,
-    )
+    # view is already renamed to display labels, so filter on the labels, not the raw fields.
+    columns = [DISPLAY[name] for name in SHOW_FIELDS if DISPLAY[name] in view.columns]
+    table = recent[columns]
+    if "Event" in columns:
+        table = table.sort_values("Event", ascending=False)
+    st.dataframe(table, use_container_width=True, hide_index=True)
 
 
 st.set_page_config(page_title="Industrial Machine Anomaly Monitor", layout="wide")
