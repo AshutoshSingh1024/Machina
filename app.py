@@ -1,5 +1,6 @@
 import json
 import math
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import altair as alt
@@ -12,6 +13,7 @@ REFRESH_SECONDS = 1.0
 RECENT = 20
 MAX_POINTS = 3000
 DENSE_ABOVE = 200
+IST = timezone(timedelta(hours=5, minutes=30))
 SENSORS = ["rpm", "torque_nm", "tool_wear_min", "power_kw", "air_temp_k", "process_temp_k"]
 DISPLAY = {
     "event_index": "Event",
@@ -28,7 +30,10 @@ DISPLAY = {
     "anomaly": "Anomaly",
     "reason_text": "Reason",
     "event_time": "Time",
+    "status": "Status",
 }
+STATUS_EVENT = "Event"
+STATUS_ANOMALY = "Anomaly"
 SHOW_FIELDS = ["event_index", "udi", "product_id", "type", *SENSORS, "failure", "anomaly", "reason_text"]
 
 
@@ -131,6 +136,50 @@ def nice_domain(series):
     return [math.floor(lo / step) * step, math.ceil(hi / step) * step]
 
 
+def ist_time(value):
+    """The event log is stamped in UTC, so shift it to IST for display."""
+    if not value:
+        return "n/a"
+    stamp = datetime.fromisoformat(value)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def reason_counts(view):
+    if "reasons" not in view.columns:
+        return pd.Series(dtype="int64")
+    exploded = view[["reasons"]].explode("reasons")
+    exploded = exploded[exploded["reasons"].notna() & (exploded["reasons"] != "")]
+    return exploded["reasons"].value_counts()
+
+
+def sensor_stats(failed, healthy):
+    """Compare the failed events against the baseline the healthy events set."""
+    rows = []
+    for name in SENSORS:
+        label = DISPLAY[name]
+        if label not in failed.columns:
+            continue
+        measured = pd.to_numeric(failed[label], errors="coerce")
+        baseline = pd.to_numeric(healthy[label], errors="coerce") if not healthy.empty else pd.Series(dtype="float64")
+        expected_mean = baseline.mean() if len(baseline) else float("nan")
+        measured_mean = measured.mean()
+        delta = measured_mean - expected_mean
+        rows.append(
+            {
+                "Parameter": label,
+                "Expected": expected_mean,
+                "Measured": measured_mean,
+                "Delta": delta,
+                "Delta %": (delta / expected_mean * 100) if expected_mean else float("nan"),
+                "Min": measured.min(),
+                "Max": measured.max(),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 @st.fragment(run_every=REFRESH_SECONDS)
 def live_dashboard():
     state = consume(EVENT_LOG)
@@ -139,10 +188,7 @@ def live_dashboard():
     cols[0].metric("Processed", state["processed"])
     cols[1].metric("Failures", state["failures"], percent(state["failures"], state["processed"]))
     cols[2].metric("Anomalies", state["anomalies"], percent(state["anomalies"], state["processed"]))
-    cols[3].metric(
-        "Last update",
-        (state["last_event_at"] or "n/a").split(".")[0].replace("T", " "),
-    )
+    cols[3].metric("Last update", ist_time(state["last_event_at"]))
 
     if state["parse_errors"]:
         st.warning(f"{state['parse_errors']} events could not be parsed and are listed below.")
@@ -157,7 +203,15 @@ def live_dashboard():
         return
 
     view = frame.rename(columns=DISPLAY)
+    # A categorical Status drives both the legend and the KPI counters.
+    view["Status"] = pd.Series(frame["anomaly"], index=frame.index).map(
+        {True: STATUS_ANOMALY, False: STATUS_EVENT}
+    ).fillna(STATUS_EVENT)
+
     recent = view.tail(RECENT)
+    anomalies = view[view["Status"] == STATUS_ANOMALY].tail(RECENT)
+    failed = view[view["Failure"] == True]  # noqa: E712
+    healthy = view[view["Failure"] != True]  # noqa: E712
     signal_labels = [DISPLAY[name] for name in SENSORS]
 
     left, right = st.columns([2, 1])
@@ -190,8 +244,13 @@ def live_dashboard():
                         title=chosen,
                         scale=alt.Scale(domain=domain, nice=False) if domain else alt.Scale(nice=False),
                     ),
-                    color=alt.Color("Anomaly:N", title="Anomaly"),
-                    tooltip=["UDI", chosen, "Reason"],
+                    color=alt.Color(
+                        "Status:N",
+                        title="Status",
+                        scale=alt.Scale(domain=[STATUS_EVENT, STATUS_ANOMALY], range=["#9ecae1", "#08519c"]),
+                        legend=alt.Legend(title="Status", orient="top"),
+                    ),
+                    tooltip=["UDI", chosen, "Reason", "Status"],
                 )
                 .properties(height=380)
             )
@@ -202,14 +261,69 @@ def live_dashboard():
             )
 
     with right:
-        st.subheader("Anomaly Causes")
-        reasons = recent.explode("reasons")
-        reasons = reasons[reasons["reasons"].notna() & (reasons["reasons"] != "")]
-        if reasons.empty:
-            st.success(f"No anomalies in the last {RECENT} events.")
+        st.subheader(f"Last {RECENT} Anomalies")
+        if anomalies.empty:
+            st.success("No anomalies yet this session.")
         else:
-            st.bar_chart(reasons["reasons"].value_counts())
+            anomaly_columns = [
+                DISPLAY[name] for name in SHOW_FIELDS if DISPLAY[name] in anomalies.columns
+            ]
+            panel = anomalies[anomaly_columns]
+            if "Event" in panel.columns:
+                panel = panel.sort_values("Event", ascending=False)
+            st.dataframe(panel, use_container_width=True, hide_index=True)
+            st.caption(f"{len(anomalies)} most recent of {len(view[view['Status'] == STATUS_ANOMALY])} total.")
 
+    st.divider()
+    st.subheader("Session Analytics")
+    st.caption("Cumulative for every event received since this page started.")
+
+    summary = st.columns(5)
+    rate = percent(state["anomalies"], state["processed"])
+    summary[0].metric("Events", state["processed"])
+    summary[1].metric("Anomalies", state["anomalies"], rate)
+    summary[2].metric("Failures", state["failures"], percent(state["failures"], state["processed"]))
+    summary[3].metric("Anomaly rate", rate)
+    last_anomaly = anomalies["Event"].max() if not anomalies.empty else None
+    summary[4].metric("Last anomaly event", "n/a" if last_anomaly is None else int(last_anomaly))
+
+    cause_col, stats_col = st.columns([1, 2])
+
+    with cause_col:
+        st.markdown("**Anomalies by parameter**")
+        causes = reason_counts(view)
+        if causes.empty:
+            st.info("No anomaly causes recorded yet.")
+        else:
+            st.bar_chart(causes.rename_axis("Reason").rename("Anomalies"))
+
+    with stats_col:
+        st.markdown("**Expected vs measured**")
+        st.caption("Expected is the mean of events that did not fail; measured is the mean of failed events.")
+        if failed.empty:
+            st.info("No failed events yet.")
+        else:
+            stats = sensor_stats(failed, healthy)
+            if stats.empty:
+                st.info("No sensor readings yet.")
+            else:
+                st.dataframe(
+                    stats.style.format(
+                        {
+                            "Expected": "{:.3f}",
+                            "Measured": "{:.3f}",
+                            "Delta": "{:+.3f}",
+                            "Delta %": "{:+.1f}%",
+                            "Min": "{:.3f}",
+                            "Max": "{:.3f}",
+                        },
+                        na_rep="n/a",
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    st.divider()
     st.subheader(f"Recent {RECENT} Events")
     # view is already renamed to display labels, so filter on the labels, not the raw fields.
     columns = [DISPLAY[name] for name in SHOW_FIELDS if DISPLAY[name] in view.columns]
