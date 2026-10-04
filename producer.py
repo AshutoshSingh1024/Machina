@@ -151,7 +151,7 @@ def main():
     parser.add_argument("--rate", type=float, default=20.0, help="events per second, 0 for as fast as possible")
     parser.add_argument("--loops", type=int, default=-1, help="dataset passes to send, -1 to replay forever")
     parser.add_argument("--segment-seconds", type=float, default=10.0, help="roll a segment after this long")
-    parser.add_argument("--segment-events", type=int, default=2000, help="roll a segment after this many events")
+    parser.add_argument("--segment-events", type=int, default=20, help="roll a segment after this many events")
     parser.add_argument("--append", action="store_true", help="keep existing segments instead of restarting")
     args = parser.parse_args()
 
