@@ -4,10 +4,10 @@
 
 ```
 ai4i2020.csv
-    |  producer.py            typed telemetry, rate limited
+    |  producer.py            typed telemetry, rate limited, rolled into segments
     v
-stream/telemetry.jsonl        one append-only newline-delimited JSON stream
-    |  flink_job.py           FileSource + monitor_continuously (continuous tail)
+stream/segment-*.jsonl        complete segments, each published with an atomic rename
+    |  flink_job.py           FileSource + monitor_continuously (discovers each segment)
     v
 classified events  ->  stdout  +  output/flink_events.jsonl
     |  app.py                 tails the event stream from its last byte offset
@@ -15,12 +15,14 @@ classified events  ->  stdout  +  output/flink_events.jsonl
 Streamlit dashboard
 ```
 
-There are no per-event files anywhere: the producer appends to a single stream and Flink follows it from the last byte it read. Both generated locations are gitignored and can be deleted at any time.
+There are no per-event files anywhere: the producer batches events into one segment at a time and Flink picks up each finished segment as it appears. Both generated locations are gitignored and can be deleted at any time.
+
+Flink's `monitor_continuously` discovers *new* files but never returns to a file that grew after it was first read, so the producer builds each segment inside `stream/.staging` and moves it into `stream/` only once complete. That keeps delivery lossless while the stream keeps growing.
 
 ## Methodology
 
-1. **Dataset replay**: `producer.py` reads `ai4i2020.csv` once, converts each row into a typed telemetry record, and appends it to `stream/telemetry.jsonl` at 20 events/sec by default.
-2. **Flink processing**: `flink_job.py` tails that stream with a continuous `FileSource`, parses each event, applies the anomaly rules, prints the classified event, and appends it to `output/flink_events.jsonl`.
+1. **Dataset replay**: `producer.py` reads `ai4i2020.csv` once, converts each row into a typed telemetry record, and streams it into a new segment every 10 seconds at 20 events/sec by default.
+2. **Flink processing**: `flink_job.py` discovers each segment with a continuous `FileSource`, parses every event, applies the anomaly rules, prints the classified event, and appends it to `output/flink_events.jsonl`.
 3. **Analysis logic**: failures come from the dataset label, while extra anomalies are flagged from tool wear, power range, thermal drift, and mechanical load.
 4. **Frontend**: `app.py` tails `output/flink_events.jsonl` starting from the byte offset it last read, so every refresh only parses the events written since the previous one.
 
@@ -33,7 +35,7 @@ There are no per-event files anywhere: the producer appends to a single stream a
 - `requirements.txt`: Python dependencies.
 - `install_windows.ps1`: installs Python, the dependencies, and Flink 1.19.1 under `C:\flink`.
 
-Created at runtime and gitignored: `stream/` and `output/`.
+Created at runtime and gitignored: `stream/` (incoming segments) and `output/` (classified event stream).
 
 ## Setup
 
@@ -67,4 +69,6 @@ py -3.11 -m streamlit run app.py
 
 Open the Streamlit URL shown in the terminal.
 
-The producer and the job each restart their own output file at startup so a run always starts from zero. Pass `--append` to either one to keep going from the existing file.
+The producer and the job each restart their own output at startup so a run always starts from zero. Pass `--append` to either one to keep going from the existing files.
+
+Segment size is controlled with `--segment-seconds` and `--segment-events`; shorter segments mean lower end-to-end latency and more files in `stream/`.

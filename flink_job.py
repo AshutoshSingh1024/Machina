@@ -1,13 +1,38 @@
 import argparse
+import ctypes
 import json
 import os
 import sys
+from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def python_executable():
+    """PyFlink's Beam runner splits the interpreter path on spaces, so prefer the 8.3 short path."""
+    candidate = sys.executable
+    if os.name != "nt":
+        return candidate
+    try:
+        get_short_path_name = ctypes.windll.kernel32.GetShortPathNameW
+        get_short_path_name.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        get_short_path_name.restype = wintypes.DWORD
+        size = get_short_path_name(candidate, None, 0)
+        if size == 0:
+            return candidate
+        buffer = ctypes.create_unicode_buffer(size)
+        if get_short_path_name(candidate, buffer, size) == 0:
+            return candidate
+        return buffer.value or candidate
+    except (AttributeError, OSError):
+        return candidate
+
+
+PYTHON_EXECUTABLE = python_executable()
+
 os.environ.setdefault("FLINK_LOG_DIR", str(Path("output/flink-log").resolve()))
-os.environ.setdefault("PYFLINK_PYTHON", sys.executable)
-os.environ.setdefault("PYFLINK_CLIENT_EXECUTABLE", sys.executable)
+os.environ.setdefault("PYFLINK_PYTHON", PYTHON_EXECUTABLE)
+os.environ.setdefault("PYFLINK_CLIENT_EXECUTABLE", PYTHON_EXECUTABLE)
 
 from pyflink.common import Duration, Types, WatermarkStrategy
 from pyflink.datastream import StreamExecutionEnvironment
