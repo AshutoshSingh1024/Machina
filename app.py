@@ -1,5 +1,5 @@
 import json
-from collections import deque
+import math
 from pathlib import Path
 
 import altair as alt
@@ -8,8 +8,10 @@ import streamlit as st
 
 
 EVENT_LOG = Path("output/flink_events.jsonl")
-WINDOW = 20
 REFRESH_SECONDS = 1.0
+RECENT = 20
+MAX_POINTS = 3000
+DENSE_ABOVE = 200
 SENSORS = ["rpm", "torque_nm", "tool_wear_min", "power_kw", "air_temp_k", "process_temp_k"]
 DISPLAY = {
     "event_index": "Event",
@@ -25,6 +27,7 @@ DISPLAY = {
     "failure": "Failure",
     "anomaly": "Anomaly",
     "reason_text": "Reason",
+    "event_time": "Time",
 }
 LABEL_TO_FIELD = {label: field for field, label in DISPLAY.items()}
 
@@ -39,12 +42,16 @@ def new_state():
         "anomalies": 0,
         "parse_errors": 0,
         "last_event_at": None,
-        "recent": deque(maxlen=WINDOW),
+        "events": [],
     }
 
 
 def consume(path):
-    """Append whatever the Flink job wrote to the event stream since the previous rerun."""
+    """Append whatever the Flink job wrote to the event stream since the previous rerun.
+
+    Every event is kept for the lifetime of the session so the trend chart can cover the
+    whole run instead of sliding a fixed window.
+    """
     if "stream" not in st.session_state:
         st.session_state.stream = new_state()
 
@@ -86,14 +93,42 @@ def consume(path):
         state["anomalies"] += int(bool(event.get("anomaly")))
         if event.get("event_time"):
             state["last_event_at"] = event["event_time"]
+
+        reasons = event.get("reasons")
+        event["reason_text"] = ", ".join(reasons) if isinstance(reasons, list) and reasons else "normal"
         event["event_index"] = state["index"]
-        state["recent"].append(event)
+        state["events"].append(event)
 
     return state
 
 
 def percent(part, whole):
     return f"{(part / whole * 100):.2f}%" if whole else "0.00%"
+
+
+def nice_domain(series):
+    """Round the y range outward to a coarse step so it only rescale occasionally.
+
+    Streamlit redraws the whole chart every second, so a domain recomputed from the raw
+    min and max would make the line jump on almost every refresh. Snapping to a 1/2/5 step
+    keeps it still for long stretches and makes the movement read as smooth.
+    """
+    try:
+        lo = float(series.min())
+        hi = float(series.max())
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+        return None
+
+    raw = (hi - lo) / 6
+    magnitude = 10 ** math.floor(math.log10(raw))
+    step = magnitude
+    for factor in (1, 2, 2.5, 5, 10):
+        step = factor * magnitude
+        if step >= raw:
+            break
+    return [math.floor(lo / step) * step, math.ceil(hi / step) * step]
 
 
 @st.fragment(run_every=REFRESH_SECONDS)
@@ -112,59 +147,78 @@ def live_dashboard():
     if state["parse_errors"]:
         st.warning(f"{state['parse_errors']} events could not be parsed and are listed below.")
 
-    if not state["recent"]:
+    if not state["events"]:
         st.info("Waiting for the first events. Start flink_job.py and producer.py, then refresh.")
         return
 
-    recent = pd.DataFrame(state["recent"])
-    if "reasons" not in recent.columns:
-        st.dataframe(recent, use_container_width=True, hide_index=True)
+    frame = pd.DataFrame(state["events"])
+    if "reasons" not in frame.columns:
+        st.dataframe(frame, use_container_width=True, hide_index=True)
         return
 
-    recent["reason_text"] = recent["reasons"].apply(
-        lambda values: ", ".join(values) if isinstance(values, list) and values else "normal"
-    )
-
-    view = recent.rename(columns=DISPLAY)
+    view = frame.rename(columns=DISPLAY)
+    recent = view.tail(RECENT)
     signal_labels = [DISPLAY[name] for name in SENSORS]
 
     left, right = st.columns([2, 1])
 
     with left:
         st.subheader("Live Sensor Trend")
-        chosen = st.selectbox("Signal", signal_labels)
+        pick_col, log_col = st.columns([3, 1])
+        with pick_col:
+            chosen = st.selectbox("Signal", signal_labels)
+        with log_col:
+            log_scale = st.checkbox("Log event axis", value=False)
+
         signal = LABEL_TO_FIELD[chosen]
-        if signal in recent.columns:
+        if signal in view.columns:
+            plotted = view
+            if len(view) > MAX_POINTS:
+                plotted = view.iloc[:: len(view) // MAX_POINTS + 1]
+
+            domain = nice_domain(plotted[chosen])
             chart = (
-                alt.Chart(view)
-                .mark_line(point=True)
+                alt.Chart(plotted)
+                .mark_line(point=len(plotted) <= DENSE_ABOVE, strokeWidth=1.5)
                 .encode(
-                    x=alt.X("Event:Q", title="Event"),
-                    y=alt.Y(f"{chosen}:Q", title=chosen),
+                    x=alt.X(
+                        "Event:Q",
+                        title="Event",
+                        scale=alt.Scale(type="log" if log_scale else "linear", nice=False),
+                    ),
+                    y=alt.Y(
+                        f"{chosen}:Q",
+                        title=chosen,
+                        scale=alt.Scale(domain=domain, nice=False) if domain else alt.Scale(nice=False),
+                    ),
                     color=alt.Color("Anomaly:N", title="Anomaly"),
                     tooltip=["UDI", chosen, "Reason"],
                 )
-                .properties(height=360)
+                .properties(height=380)
             )
             st.altair_chart(chart, use_container_width=True)
+            st.caption(
+                f"Events 1 to {state['index']}"
+                + (f", every {len(view) // MAX_POINTS + 1}th shown" if len(view) > MAX_POINTS else "")
+            )
 
     with right:
         st.subheader("Anomaly Causes")
         reasons = recent.explode("reasons")
         reasons = reasons[reasons["reasons"].notna() & (reasons["reasons"] != "")]
         if reasons.empty:
-            st.success("No anomalies in the rolling window.")
+            st.success(f"No anomalies in the last {RECENT} events.")
         else:
             st.bar_chart(reasons["reasons"].value_counts())
 
-    st.subheader("Recent Events")
+    st.subheader(f"Recent {RECENT} Events")
     columns = [
         DISPLAY[name]
         for name in ["event_index", "udi", "product_id", "type", *SENSORS, "failure", "anomaly", "reason_text"]
-        if name in recent.columns
+        if name in view.columns
     ]
     st.dataframe(
-        view[columns].sort_values("Event", ascending=False),
+        recent[columns].sort_values("Event", ascending=False),
         use_container_width=True,
         hide_index=True,
     )
@@ -173,7 +227,8 @@ def live_dashboard():
 st.set_page_config(page_title="Industrial Machine Anomaly Monitor", layout="wide")
 st.title("Industrial Machine Anomaly Monitor")
 st.caption(
-    "Methodology: producer.py appends telemetry to a stream, flink_job.py tails it and applies "
-    "the anomaly rules, and this page consumes the classified event stream as it is written."
+    "Methodology: producer.py streams telemetry in segments, flink_job.py picks up each "
+    "segment and applies the anomaly rules, and this page consumes the classified event "
+    "stream as it is written, refreshing every second."
 )
 live_dashboard()
