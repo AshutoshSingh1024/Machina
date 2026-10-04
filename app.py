@@ -8,9 +8,25 @@ import streamlit as st
 
 
 EVENT_LOG = Path("output/flink_events.jsonl")
-WINDOW = 250
+WINDOW = 20
 REFRESH_SECONDS = 1.0
 SENSORS = ["rpm", "torque_nm", "tool_wear_min", "power_kw", "air_temp_k", "process_temp_k"]
+DISPLAY = {
+    "event_index": "Event",
+    "udi": "UDI",
+    "product_id": "Product ID",
+    "type": "Type",
+    "rpm": "RPM",
+    "torque_nm": "Torque (Nm)",
+    "tool_wear_min": "Tool Wear (min)",
+    "power_kw": "Power (kW)",
+    "air_temp_k": "Air Temp (K)",
+    "process_temp_k": "Process Temp (K)",
+    "failure": "Failure",
+    "anomaly": "Anomaly",
+    "reason_text": "Reason",
+}
+LABEL_TO_FIELD = {label: field for field, label in DISPLAY.items()}
 
 
 def new_state():
@@ -109,20 +125,24 @@ def live_dashboard():
         lambda values: ", ".join(values) if isinstance(values, list) and values else "normal"
     )
 
+    view = recent.rename(columns=DISPLAY)
+    signal_labels = [DISPLAY[name] for name in SENSORS]
+
     left, right = st.columns([2, 1])
 
     with left:
         st.subheader("Live Sensor Trend")
-        metric = st.selectbox("Signal", SENSORS)
-        if metric in recent.columns:
+        chosen = st.selectbox("Signal", signal_labels)
+        signal = LABEL_TO_FIELD[chosen]
+        if signal in recent.columns:
             chart = (
-                alt.Chart(recent)
+                alt.Chart(view)
                 .mark_line(point=True)
                 .encode(
-                    x="event_index:Q",
-                    y=f"{metric}:Q",
-                    color="anomaly:N",
-                    tooltip=["udi", metric, "reason_text"],
+                    x=alt.X("Event:Q", title="Event"),
+                    y=alt.Y(f"{chosen}:Q", title=chosen),
+                    color=alt.Color("Anomaly:N", title="Anomaly"),
+                    tooltip=["UDI", chosen, "Reason"],
                 )
                 .properties(height=360)
             )
@@ -138,9 +158,13 @@ def live_dashboard():
             st.bar_chart(reasons["reasons"].value_counts())
 
     st.subheader("Recent Events")
-    columns = [c for c in ["event_index", "udi", "product_id", "type", *SENSORS, "failure", "anomaly", "reason_text"] if c in recent.columns]
+    columns = [
+        DISPLAY[name]
+        for name in ["event_index", "udi", "product_id", "type", *SENSORS, "failure", "anomaly", "reason_text"]
+        if name in recent.columns
+    ]
     st.dataframe(
-        recent[columns].sort_values("event_index", ascending=False),
+        view[columns].sort_values("Event", ascending=False),
         use_container_width=True,
         hide_index=True,
     )

@@ -24,7 +24,7 @@ Flink's `monitor_continuously` discovers *new* files but never returns to a file
 1. **Dataset replay**: `producer.py` reads `ai4i2020.csv` once, converts each row into a typed telemetry record, and streams it into a new segment every 10 seconds at 20 events/sec by default.
 2. **Flink processing**: `flink_job.py` discovers each segment with a continuous `FileSource`, parses every event, applies the anomaly rules, prints the classified event, and appends it to `output/flink_events.jsonl`.
 3. **Analysis logic**: failures come from the dataset label, while extra anomalies are flagged from tool wear, power range, thermal drift, and mechanical load.
-4. **Frontend**: `app.py` tails `output/flink_events.jsonl` starting from the byte offset it last read, so every refresh only parses the events written since the previous one.
+4. **Frontend**: `app.py` tails `output/flink_events.jsonl` starting from the byte offset it last read, so every refresh only parses the events written since the previous one. The KPI counts are cumulative for the run, while the chart, anomaly causes, and event table show only the most recent 20 events.
 
 ## Files
 
@@ -60,7 +60,7 @@ py -3.11 flink_job.py
 ```
 
 ```powershell
-py -3.11 producer.py --rate 20
+py -3.11 producer.py
 ```
 
 ```powershell
@@ -68,6 +68,22 @@ py -3.11 -m streamlit run app.py
 ```
 
 Open the Streamlit URL shown in the terminal.
+
+## Storage
+
+Everything is disposable and nothing is tracked by git. While the job runs, two locations grow:
+
+| Location | Growth at the default 20 events/sec |
+| --- | --- |
+| `stream/` | ~6 segment files per minute, ~30 KB each |
+| `output/flink_events.jsonl` | ~300 KB per minute |
+| `output/flink-log/` | a few MB per hour |
+
+That is roughly 30 MB per hour of runtime. Each run resets both locations at startup, so there is nothing to do between runs. To remove everything after the last one:
+
+```powershell
+Remove-Item -Recurse -Force stream, output
+```
 
 The producer and the job each restart their own output at startup so a run always starts from zero. Pass `--append` to either one to keep going from the existing files.
 
