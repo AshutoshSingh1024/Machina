@@ -35,6 +35,15 @@ DISPLAY = {
 STATUS_EVENT = "Event"
 STATUS_ANOMALY = "Anomaly"
 SHOW_FIELDS = ["event_index", "udi", "product_id", "type", *SENSORS, "failure", "anomaly", "reason_text"]
+REASON_LABELS = {
+    "dataset_failure_label": "Machine Failure",
+    "high_tool_wear": "High Tool Wear",
+    "abnormal_power": "Abnormal Power",
+    "thermal_drift": "Thermal Drift",
+    "mechanical_load": "Mechanical Load",
+}
+SEARCH_FIELDS = ["Event", "UDI", "Product ID", "Type", "Reason"]
+FAILURE_LIMITS = [10, 20, 50, 100]
 
 
 def new_state():
@@ -180,6 +189,45 @@ def sensor_stats(failed, healthy):
     return pd.DataFrame(rows)
 
 
+def reason_label(reason):
+    """Readability for the rule codes the job emits."""
+    return REASON_LABELS.get(reason, str(reason).replace("_", " ").title())
+
+
+def fault_parameters(view):
+    """The distinct fault parameters this session has produced, as labels."""
+    if "reasons" not in view.columns:
+        return []
+    labels = set()
+    for reasons in view["reasons"]:
+        if isinstance(reasons, list):
+            labels.update(reason_label(reason) for reason in reasons)
+    return sorted(labels)
+
+
+def failure_results(view, parameters, search):
+    """Failed events matching the chosen parameters and search text, oldest first."""
+    failed = view[view["Failure"] == True]  # noqa: E712
+    if parameters:
+        wanted = set(parameters)
+        failed = failed[
+            failed["reasons"].map(
+                lambda reasons: any(reason_label(r) in wanted for r in reasons)
+                if isinstance(reasons, list)
+                else False
+            )
+        ]
+    if search:
+        needle = search.strip().lower()
+        if needle:
+            fields = [field for field in SEARCH_FIELDS if field in failed.columns]
+            haystack = (
+                failed[fields].astype(str).agg(" ".join, axis=1).str.lower()
+            )
+            failed = failed[haystack.str.contains(needle, regex=False, na=False)]
+    return failed
+
+
 @st.fragment(run_every=REFRESH_SECONDS)
 def live_dashboard():
     state = consume(EVENT_LOG)
@@ -322,6 +370,53 @@ def live_dashboard():
                     use_container_width=True,
                     hide_index=True,
                 )
+
+    st.divider()
+    st.subheader("Failure Results")
+    st.caption(
+        "Failed events from this session, narrowed by the parameter they "
+        "faulted on and by a free-text search."
+    )
+
+    search_col, param_col, limit_col = st.columns([2, 3, 1])
+    with search_col:
+        search = st.text_input(
+            "Search",
+            value="",
+            placeholder="UDI, product, type, event or reason",
+            key="failure_search",
+        )
+    with param_col:
+        parameters = st.multiselect(
+            "Fault parameters",
+            options=fault_parameters(view),
+            default=[],
+            key="failure_parameters",
+        )
+    with limit_col:
+        limit = st.selectbox(
+            "Show",
+            options=FAILURE_LIMITS,
+            index=1,
+            key="failure_limit",
+        )
+
+    matched = failure_results(view, parameters, search)
+    if matched.empty:
+        st.info("No failed events match the current filters.")
+    else:
+        panel = matched.tail(limit)
+        failure_columns = [
+            DISPLAY[name] for name in SHOW_FIELDS if DISPLAY[name] in panel.columns
+        ]
+        table = panel[failure_columns]
+        if "Event" in table.columns:
+            table = table.sort_values("Event", ascending=False)
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.caption(
+            f"{len(table)} shown of {len(matched)} matching "
+            f"out of {len(view[view['Failure'] == True])} failed events."  # noqa: E712
+        )
 
     st.divider()
     st.subheader(f"Recent {RECENT} Events")
